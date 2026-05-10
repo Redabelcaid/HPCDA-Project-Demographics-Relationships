@@ -92,6 +92,8 @@ function drawMatrix(container: HTMLElement, cells: GroupCell[], participants: Pa
     .attr("rx", 2)
     .attr("fill", (d) => color(d.normalized))
     .attr("fill-opacity", 1)
+    .attr("stroke", "transparent")
+    .attr("stroke-width", 0)
     .style("cursor", "pointer");
 
   cellSel
@@ -100,6 +102,22 @@ function drawMatrix(container: HTMLElement, cells: GroupCell[], participants: Pa
       const toIds = idsByGroup.get(d.to_group) ?? [];
       const union = Array.from(new Set([...fromIds, ...toIds]));
       if (union.length > 0) selection.setIds(union, { kind: "chart" });
+    })
+    .on("mouseenter", function (_e, d) {
+      // Hover stroke — only if not already a selected cell
+      const inSel = (this as SVGRectElement).getAttribute("data-active") === "1";
+      if (inSel) return;
+      d3.select(this)
+        .attr("stroke", "#1f6f5e")
+        .attr("stroke-width", 2);
+    })
+    .on("mouseleave", function () {
+      const inSel = (this as SVGRectElement).getAttribute("data-active") === "1";
+      if (inSel) {
+        d3.select(this).attr("stroke", "#0e3d33").attr("stroke-width", 2.5);
+      } else {
+        d3.select(this).attr("stroke", "transparent").attr("stroke-width", 0);
+      }
     })
     .append("title")
     .text((d) =>
@@ -120,10 +138,23 @@ function drawMatrix(container: HTMLElement, cells: GroupCell[], participants: Pa
       }
     }
 
+    cellSel
+      .attr("data-active", (d) =>
+        (!sel.isEmpty && groupsInSel.has(d.from_group) && groupsInSel.has(d.to_group)) ? "1" : "0",
+      );
+
     cellSel.transition().duration(180).ease(d3.easeCubicOut)
       .attr("fill-opacity", (d) => {
         if (sel.isEmpty) return 1;
         return (groupsInSel.has(d.from_group) || groupsInSel.has(d.to_group)) ? 1 : 0.2;
+      })
+      .attr("stroke", (d) => {
+        if (sel.isEmpty) return "transparent";
+        return (groupsInSel.has(d.from_group) && groupsInSel.has(d.to_group)) ? "#0e3d33" : "transparent";
+      })
+      .attr("stroke-width", (d) => {
+        if (sel.isEmpty) return 0;
+        return (groupsInSel.has(d.from_group) && groupsInSel.has(d.to_group)) ? 2.5 : 0;
       });
   });
 

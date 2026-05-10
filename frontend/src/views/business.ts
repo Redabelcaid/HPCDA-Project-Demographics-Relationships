@@ -30,15 +30,18 @@ const EDU_COLOR = d3.scaleOrdinal<string, string>()
   .domain(EDU_ORDER)
   .range(["#a8dcc7", "#3aa28a", "#22c597", "#0e3d33"]);
 
+type EmploymentMap = Record<number, { buildingId: number; employerId: number | null }>;
+
 export async function renderBusiness(container: HTMLElement) {
-  const [jobs, employers, participants] = await Promise.all([
+  const [jobs, employers, participants, employment] = await Promise.all([
     apiGet<Job[]>("/derived/jobs.json"),
     apiGet<EmployerStat[]>("/derived/employer_stats.json"),
     apiGet<Participant[]>("/derived/participants.json"),
+    apiGet<EmploymentMap>("/derived/participant_employment.json"),
   ]);
 
   drawWageScatter(container, jobs, participants);
-  drawEmployerSizes(container, employers);
+  drawEmployerSizes(container, employers, employment);
 }
 
 function drawWageScatter(container: HTMLElement, jobs: Job[], participants: Participant[]) {
@@ -154,10 +157,14 @@ function drawWageScatter(container: HTMLElement, jobs: Job[], participants: Part
   });
 }
 
-function drawEmployerSizes(container: HTMLElement, employers: EmployerStat[]) {
+function drawEmployerSizes(
+  container: HTMLElement,
+  employers: EmployerStat[],
+  employment: EmploymentMap,
+) {
   const wrap = document.createElement("div");
   wrap.className = "chart";
-  wrap.innerHTML = `<div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px;font-weight:500;">Employer size distribution (jobs per employer)</div>`;
+  wrap.innerHTML = `<div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px;font-weight:500;">Employer size distribution <span style="color:var(--text-tertiary);font-weight:400;">(city in pale; selection's employers in teal)</span></div>`;
   container.appendChild(wrap);
 
   const w = 460, h = 130;
@@ -168,23 +175,24 @@ function drawEmployerSizes(container: HTMLElement, employers: EmployerStat[]) {
     .style("width", "100%")
     .style("height", "auto");
 
-  // Vertical gradient — vivid emerald to deep teal
-  const gradId = "biz-bar-gradient";
+  // Selection-overlay gradient — vivid emerald to deep teal
+  const gradId = "biz-bar-gradient-sel";
   const grad = svg.append("defs").append("linearGradient")
     .attr("id", gradId).attr("x1", "0%").attr("y1", "0%").attr("x2", "0%").attr("y2", "100%");
   grad.append("stop").attr("offset", "0%").attr("stop-color", "#22c597");
   grad.append("stop").attr("offset", "100%").attr("stop-color", "#1f6f5e");
 
-  const counts = d3.rollup(employers, (v) => v.length, (d) => d.n_jobs);
-  const bars = Array.from(counts, ([n_jobs, count]) => ({ n_jobs, count }))
+  // City-wide: count of employers grouped by job count
+  const allCounts = d3.rollup(employers, (v) => v.length, (d) => d.n_jobs);
+  const allBars = Array.from(allCounts, ([n_jobs, count]) => ({ n_jobs, count }))
     .sort((a, b) => a.n_jobs - b.n_jobs);
 
   const x = d3.scaleBand()
-    .domain(bars.map((b) => String(b.n_jobs)))
+    .domain(allBars.map((b) => String(b.n_jobs)))
     .range([margin.left, w - margin.right])
     .padding(0.18);
   const y = d3.scaleLinear()
-    .domain([0, d3.max(bars, (b) => b.count) ?? 0]).nice()
+    .domain([0, d3.max(allBars, (b) => b.count) ?? 0]).nice()
     .range([h - margin.bottom, margin.top]);
 
   svg.append("g")
@@ -194,14 +202,54 @@ function drawEmployerSizes(container: HTMLElement, employers: EmployerStat[]) {
     .attr("transform", `translate(${margin.left},0)`)
     .call(d3.axisLeft(y).ticks(3).tickSizeOuter(0));
 
+  // Background layer: city-wide bars (always visible, pale)
   svg.append("g")
     .selectAll("rect")
-    .data(bars)
+    .data(allBars)
     .join("rect")
     .attr("x", (d) => x(String(d.n_jobs)) ?? 0)
     .attr("y", (d) => y(d.count))
     .attr("width", x.bandwidth())
     .attr("height", (d) => h - margin.bottom - y(d.count))
     .attr("rx", 3)
-    .attr("fill", `url(#${gradId})`);
+    .attr("fill", "#7fc9b0")
+    .attr("fill-opacity", 0.85);
+
+  // Foreground layer: re-renders on selection change
+  const selGroup = svg.append("g").attr("class", "biz-sel");
+
+  // Map: employerId -> n_jobs (for fast lookup of selected employers' sizes)
+  const sizeByEmployer = new Map<number, number>();
+  for (const e of employers) sizeByEmployer.set(e.employerId, e.n_jobs);
+
+  selection.subscribe((sel) => {
+    selGroup.selectAll("rect").remove();
+    if (sel.isEmpty) return;
+
+    // For each selected participant, look up their employerId, then n_jobs
+    const empIds = new Set<number>();
+    for (const pid of sel.participantIds) {
+      const e = employment[pid];
+      if (e && e.employerId != null) empIds.add(e.employerId);
+    }
+    if (empIds.size === 0) return;
+
+    // Count employers grouped by n_jobs (only those selected residents work at)
+    const selCounts = new Map<number, number>();
+    for (const eid of empIds) {
+      const njobs = sizeByEmployer.get(eid);
+      if (njobs != null) selCounts.set(njobs, (selCounts.get(njobs) ?? 0) + 1);
+    }
+
+    const selBars = Array.from(selCounts, ([n_jobs, count]) => ({ n_jobs, count }));
+    selGroup.selectAll("rect")
+      .data(selBars)
+      .join("rect")
+      .attr("x", (d) => x(String(d.n_jobs)) ?? 0)
+      .attr("y", (d) => y(d.count))
+      .attr("width", x.bandwidth())
+      .attr("height", (d) => h - margin.bottom - y(d.count))
+      .attr("rx", 3)
+      .attr("fill", `url(#${gradId})`);
+  });
 }

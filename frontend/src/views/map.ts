@@ -142,6 +142,15 @@ function drawMap(
     <label><input type="radio" name="overlay" value="joviality"> Mean joviality</label>
     <label><input type="radio" name="overlay" value="group"> Dominant interest group</label>
     <label><input type="radio" name="overlay" value="wage"> Mean wage</label>
+    <div style="border-top:1px solid #eee;margin-top:6px;padding-top:6px;">
+      <label style="display:flex;align-items:center;gap:4px;">
+        <input type="checkbox" id="vacancy-toggle">
+        <span>Highlight unoccupied residences</span>
+      </label>
+      <div style="font-size:9px;color:#888;margin-top:2px;line-height:1.3;">
+        Residential buildings with no participants in our sample.
+      </div>
+    </div>
     <div style="font-size:10px;color:#888;margin-top:6px;font-style:italic;">Tip: Shift+drag to lasso a region</div>
     <div id="overlay-legend" style="margin-top:6px;border-top:1px solid #eee;padding-top:6px;min-height:30px;"></div>
   `;
@@ -207,10 +216,34 @@ function drawMap(
   const buildingsHatchLayer = root.append("g").attr("class", "buildings-hatch");
   const arcsLayer = root.append("g").attr("class", "arcs").attr("fill", "none");
   const endpointsLayer = root.append("g").attr("class", "endpoints");
-  // Lasso layer is at the SVG root (NOT inside the zoomable `root` group)
-  // so the rectangle stays in screen-coords visually while we still can
-  // map its corners back to world coords using the zoom transform.
-  const lassoLayer = svg.append("g").attr("class", "lasso").style("pointer-events", "none");
+  // Vacancy layer for animated highlight overlays on data-empty
+  // residential buildings. Each entry renders the building's polygon
+  // path tinted bright red and pulses via CSS. Lives inside root so
+  // overlays stay anchored to their buildings under pan/zoom. Hidden
+  // by default; toggled by the toolbar checkbox.
+  const vacancyLayer = root.append("g")
+    .attr("class", "vacancy-highlights")
+    .style("pointer-events", "none")
+    .style("display", "none");
+  // Lasso rectangle is added INTO `root` (the zoomable group) so it
+  // moves with the map under pan/zoom — i.e. it stays anchored to the
+  // physical city region the user selected, not to the screen.
+  const lassoLayer = root.append("g").attr("class", "lasso").style("pointer-events", "none");
+
+  // Inject the pulse keyframe + class — scoped via class name so it
+  // only affects vacancy highlights inside this map.
+  const pulseStyle = document.createElement("style");
+  pulseStyle.textContent = `
+    @keyframes vacancy-pulse {
+      0%, 100% { opacity: 0.35; }
+      50%      { opacity: 0.85; }
+    }
+    .vacancy-highlight {
+      animation: vacancy-pulse 2s ease-in-out infinite;
+      pointer-events: none;
+    }
+  `;
+  target.appendChild(pulseStyle);
 
   const pathFor = (rings: [number, number][][]) =>
     rings.map((ring) => {
@@ -380,8 +413,45 @@ function drawMap(
     }
   }
 
+  // ---- Vacancy highlights (data-empty residential buildings) ----
+  // Residential buildings with zero participants in our sample. Honestly
+  // labeled: this means "no observed residents in the data", not necessarily
+  // that the apartment is physically vacant — the city's app reached only
+  // ~1000 people, so unsampled non-participants may still live there.
+  const dataEmptyResidentials = buildings.filter((b) => {
+    if (b.buildingType !== "Residental") return false;
+    const residents = residentsByBuilding.get(b.buildingId) ?? [];
+    return residents.length === 0;
+  });
+
+  // Render each as a stroked outline overlay: no fill (so the underlying
+  // building stays visible), bright red stroke that pulses via CSS.
+  // All overlays share the same animation phase so they pulse in unison.
+  vacancyLayer.selectAll<SVGPathElement, Building>("path")
+    .data(dataEmptyResidentials)
+    .join("path")
+    .attr("class", "vacancy-highlight")
+    .attr("d", (d) => pathFor(d.rings))
+    .attr("fill-rule", "evenodd")
+    .attr("fill", "none")
+    .attr("stroke", "#ff2e3f")
+    .attr("stroke-width", 3)
+    .attr("vector-effect", "non-scaling-stroke")
+    .style("filter", "drop-shadow(0 0 3px #ff2e3f)");
+
+  // Toggle handler
+  const vacancyToggle = toolbar.querySelector<HTMLInputElement>("#vacancy-toggle");
+  if (vacancyToggle) {
+    vacancyToggle.addEventListener("change", () => {
+      vacancyLayer.style("display", vacancyToggle.checked ? null : "none");
+    });
+  }
+
   let lassoRect: d3.Selection<SVGRectElement, unknown, null, undefined> | null = null;
-  let lassoStartView: [number, number] | null = null;
+  // lassoStartWorld is the rectangle's start corner in WORLD coordinates
+  // (not viewBox/screen). Storing in world coords means the rectangle
+  // stays anchored to the city as the user pans/zooms.
+  let lassoStartWorld: [number, number] | null = null;
   let isLassoing = false;
   let justLassoedFlag = false;
 
@@ -407,12 +477,18 @@ function drawMap(
     event.stopPropagation();
 
     isLassoing = true;
-    lassoStartView = d3.pointer(event, svgNode) as [number, number];
+    lassoStartWorld = eventToWorld(event);
 
+    // Rectangle is added INSIDE root (zoomable group). Its coordinates
+    // are world coords with y-axis flipped (rendered as `-y`) to match
+    // how building paths are drawn ("M x,-y ..."). We don't use
+    // vector-effect:non-scaling-stroke here because we WANT the
+    // rectangle to scale with zoom — it's anchored to the city.
     if (lassoRect) lassoRect.remove();
+    const [sx, sy] = lassoStartWorld;
     lassoRect = lassoLayer.append("rect")
-      .attr("x", lassoStartView[0])
-      .attr("y", lassoStartView[1])
+      .attr("x", sx)
+      .attr("y", -sy)
       .attr("width", 0)
       .attr("height", 0)
       .attr("fill", "rgba(34, 197, 151, 0.15)")
@@ -425,14 +501,19 @@ function drawMap(
   });
 
   window.addEventListener("mousemove", (event: MouseEvent) => {
-    if (!isLassoing || !lassoRect || !lassoStartView) return;
-    const [vx, vy] = d3.pointer(event, svgNode);
-    const [vsx, vsy] = lassoStartView;
+    if (!isLassoing || !lassoRect || !lassoStartWorld) return;
+    const [wx, wy] = eventToWorld(event);
+    const [sx, sy] = lassoStartWorld;
+    // SVG rect uses y = -worldY (because the map renders points as [x,-y])
+    const minWX = Math.min(sx, wx);
+    const maxWX = Math.max(sx, wx);
+    const minWY = Math.min(sy, wy);
+    const maxWY = Math.max(sy, wy);
     lassoRect
-      .attr("x", Math.min(vsx, vx))
-      .attr("y", Math.min(vsy, vy))
-      .attr("width", Math.abs(vx - vsx))
-      .attr("height", Math.abs(vy - vsy));
+      .attr("x", minWX)
+      .attr("y", -maxWY)        // flipped: top of rect in screen-y = max world-y
+      .attr("width", maxWX - minWX)
+      .attr("height", maxWY - minWY);
   });
 
   window.addEventListener("mouseup", (event: MouseEvent) => {
@@ -440,29 +521,23 @@ function drawMap(
     isLassoing = false;
     svg.style("cursor", "grab");
 
-    if (!lassoStartView) {
+    if (!lassoStartWorld) {
       if (lassoRect) { lassoRect.remove(); lassoRect = null; }
       return;
     }
 
-    // Convert viewBox-coord rect corners to world-coord rect
-    const startW = (() => {
-      const [vsx, vsy] = lassoStartView!;
-      const t = d3.zoomTransform(svgNode);
-      const [ux, uy] = t.invert([vsx, vsy]);
-      return [ux, -uy] as [number, number];
-    })();
-    const endW = eventToWorld(event);
-    const minX = Math.min(startW[0], endW[0]);
-    const maxX = Math.max(startW[0], endW[0]);
-    const minY = Math.min(startW[1], endW[1]);
-    const maxY = Math.max(startW[1], endW[1]);
+    const [endX, endY] = eventToWorld(event);
+    const [startX, startY] = lassoStartWorld;
+    const minX = Math.min(startX, endX);
+    const maxX = Math.max(startX, endX);
+    const minY = Math.min(startY, endY);
+    const maxY = Math.max(startY, endY);
 
     // Tiny rectangles → likely accidental shift+click → just bail
     const widthW = maxX - minX, heightW = maxY - minY;
     if (widthW < 5 || heightW < 5) {
       if (lassoRect) { lassoRect.remove(); lassoRect = null; }
-      lassoStartView = null;
+      lassoStartWorld = null;
       return;
     }
 
@@ -479,7 +554,7 @@ function drawMap(
 
     if (pids.size === 0) {
       if (lassoRect) { lassoRect.remove(); lassoRect = null; }
-      lassoStartView = null;
+      lassoStartWorld = null;
       return;
     }
 
@@ -494,7 +569,7 @@ function drawMap(
       .attr("fill", "rgba(34, 197, 151, 0.05)")
       .attr("stroke-width", 1);
 
-    lassoStartView = null;
+    lassoStartWorld = null;
     justLassoedFlag = true;
   });
 

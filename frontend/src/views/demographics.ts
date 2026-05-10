@@ -188,7 +188,7 @@ export async function renderDemographics(container: HTMLElement) {
   function rerender(sel: { isEmpty: boolean; participantIds: Set<number> }) {
     host.innerHTML = "";
     // Overview always visible at the top
-    renderOverview(host, cachedData!);
+    renderOverview(host, cachedData!, sel);
     // Card appears below the overview only when there's an active selection
     if (!sel.isEmpty) {
       const divider = document.createElement("div");
@@ -206,15 +206,23 @@ export async function renderDemographics(container: HTMLElement) {
 // Overview mode (no selection): age histogram + interest groups bar
 // ---------------------------------------------------------------------
 
-function renderOverview(host: HTMLElement, data: ParticipantData) {
-  drawAgeHistogram(host, data.participants);
-  drawInterestGroups(host, data.groups, data.participants);
+function renderOverview(
+  host: HTMLElement,
+  data: ParticipantData,
+  sel: { isEmpty: boolean; participantIds: Set<number> },
+) {
+  drawAgeHistogram(host, data.participants, sel);
+  drawInterestGroups(host, data.groups, data.participants, sel);
 }
 
-function drawAgeHistogram(container: HTMLElement, participants: Participant[]) {
+function drawAgeHistogram(
+  container: HTMLElement,
+  participants: Participant[],
+  sel: { isEmpty: boolean; participantIds: Set<number> },
+) {
   const wrap = document.createElement("div");
   wrap.className = "chart";
-  wrap.innerHTML = `<div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px;font-weight:500;">Age distribution</div>`;
+  wrap.innerHTML = `<div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px;font-weight:500;">Age distribution <span style="color:var(--text-tertiary);font-weight:400;">(city in pale; selection in teal)</span></div>`;
   container.appendChild(wrap);
 
   const w = 460, h = 140;
@@ -225,21 +233,26 @@ function drawAgeHistogram(container: HTMLElement, participants: Participant[]) {
     .style("width", "100%")
     .style("height", "auto");
 
-  const gradId = "age-bar-gradient";
+  // Selected-overlay gradient: vivid teal at top, deep teal at bottom
+  const gradId = "age-bar-gradient-sel";
   const grad = svg.append("defs").append("linearGradient")
     .attr("id", gradId).attr("x1", "0%").attr("y1", "0%").attr("x2", "0%").attr("y2", "100%");
-  grad.append("stop").attr("offset", "0%").attr("stop-color", "#3aa28a");
+  grad.append("stop").attr("offset", "0%").attr("stop-color", "#22c597");
   grad.append("stop").attr("offset", "100%").attr("stop-color", "#0e3d33");
 
-  const ages = participants.map((p) => p.age);
+  const allAges = participants.map((p) => p.age);
   const x = d3.scaleLinear()
-    .domain(d3.extent(ages) as [number, number]).nice()
+    .domain(d3.extent(allAges) as [number, number]).nice()
     .range([margin.left, w - margin.right]);
 
-  const bins = d3.bin().domain(x.domain() as [number, number]).thresholds(20)(ages);
+  const binner = d3.bin<number, number>()
+    .domain(x.domain() as [number, number])
+    .thresholds(20);
+
+  const allBins = binner(allAges);
 
   const y = d3.scaleLinear()
-    .domain([0, d3.max(bins, (b) => b.length) ?? 0]).nice()
+    .domain([0, d3.max(allBins, (b) => b.length) ?? 0]).nice()
     .range([h - margin.bottom, margin.top]);
 
   svg.append("g")
@@ -249,22 +262,49 @@ function drawAgeHistogram(container: HTMLElement, participants: Participant[]) {
     .attr("transform", `translate(${margin.left},0)`)
     .call(d3.axisLeft(y).ticks(3).tickSizeOuter(0));
 
+  // Background layer: city-wide bars (always visible, pale teal)
   svg.append("g")
     .selectAll("rect")
-    .data(bins)
+    .data(allBins)
     .join("rect")
     .attr("x", (d) => x(d.x0!) + 1)
     .attr("y", (d) => y(d.length))
     .attr("width", (d) => Math.max(0, x(d.x1!) - x(d.x0!) - 2))
     .attr("height", (d) => Math.max(0, h - margin.bottom - y(d.length)))
     .attr("rx", 2)
-    .attr("fill", `url(#${gradId})`);
+    .attr("fill", "#7fc9b0")
+    .attr("fill-opacity", 0.85);
+
+  // Foreground layer: selected bars (only drawn when selection non-empty)
+  if (!sel.isEmpty) {
+    const ageByPid = new Map<number, number>();
+    for (const p of participants) ageByPid.set(p.participantId, p.age);
+    const selAges: number[] = [];
+    for (const pid of sel.participantIds) {
+      const age = ageByPid.get(pid);
+      if (age != null) selAges.push(age);
+    }
+    if (selAges.length > 0) {
+      const selBins = binner(selAges);
+      svg.append("g")
+        .selectAll("rect")
+        .data(selBins)
+        .join("rect")
+        .attr("x", (d) => x(d.x0!) + 1)
+        .attr("y", (d) => y(d.length))
+        .attr("width", (d) => Math.max(0, x(d.x1!) - x(d.x0!) - 2))
+        .attr("height", (d) => Math.max(0, h - margin.bottom - y(d.length)))
+        .attr("rx", 2)
+        .attr("fill", `url(#${gradId})`);
+    }
+  }
 }
 
 function drawInterestGroups(
   container: HTMLElement,
   groups: InterestGroup[],
   participants: Participant[],
+  sel: { isEmpty: boolean; participantIds: Set<number> },
 ) {
   const wrap = document.createElement("div");
   wrap.className = "chart";
@@ -302,12 +342,37 @@ function drawInterestGroups(
     .call(d3.axisLeft(y).ticks(4).tickSizeOuter(0));
 
   const idsByGroup = new Map<string, number[]>();
+  const groupByPid = new Map<number, string>();
   for (const p of participants) {
     if (!idsByGroup.has(p.interestGroup)) idsByGroup.set(p.interestGroup, []);
     idsByGroup.get(p.interestGroup)!.push(p.participantId);
+    groupByPid.set(p.participantId, p.interestGroup);
   }
 
-  svg.append("g")
+  // Determine which groups are "active" — i.e. have selected members.
+  // If selection is non-empty AND a single group fully matches the
+  // selection, treat it as the focused group (gets the strongest mark).
+  // If selection spans multiple groups, all involved groups get a softer
+  // highlight.
+  const groupsInSel = new Set<string>();
+  if (!sel.isEmpty) {
+    for (const pid of sel.participantIds) {
+      const g = groupByPid.get(pid);
+      if (g) groupsInSel.add(g);
+    }
+  }
+  // Detect "single group equals exactly this selection"
+  let focusedGroup: string | null = null;
+  if (groupsInSel.size === 1) {
+    const onlyGroup = Array.from(groupsInSel)[0];
+    const onlyGroupIds = idsByGroup.get(onlyGroup) ?? [];
+    if (sel.participantIds.size === onlyGroupIds.length &&
+        onlyGroupIds.every((pid) => sel.participantIds.has(pid))) {
+      focusedGroup = onlyGroup;
+    }
+  }
+
+  const bars = svg.append("g")
     .selectAll<SVGRectElement, InterestGroup>("rect")
     .data(sorted)
     .join("rect")
@@ -317,7 +382,30 @@ function drawInterestGroups(
     .attr("height", (d) => h - margin.bottom - y(d.n))
     .attr("rx", 3)
     .attr("fill", (d) => color(d.mean_joviality))
-    .style("cursor", "pointer")
+    .attr("stroke", (d) => {
+      if (focusedGroup === d.interestGroup) return "#0e3d33";
+      if (groupsInSel.has(d.interestGroup)) return "#1f6f5e";
+      return "transparent";
+    })
+    .attr("stroke-width", (d) => focusedGroup === d.interestGroup ? 3 : (groupsInSel.has(d.interestGroup) ? 1.5 : 0))
+    .style("cursor", "pointer");
+
+  // Hover effect — only modify the stroke if the bar isn't already the
+  // selection's focused group (don't visually weaken the active mark)
+  bars
+    .on("mouseenter", function (_e, d) {
+      if (focusedGroup === d.interestGroup) return;
+      d3.select(this).attr("stroke", "#1f6f5e").attr("stroke-width", 2);
+    })
+    .on("mouseleave", function (_e, d) {
+      if (focusedGroup === d.interestGroup) {
+        d3.select(this).attr("stroke", "#0e3d33").attr("stroke-width", 3);
+      } else if (groupsInSel.has(d.interestGroup)) {
+        d3.select(this).attr("stroke", "#1f6f5e").attr("stroke-width", 1.5);
+      } else {
+        d3.select(this).attr("stroke", "transparent").attr("stroke-width", 0);
+      }
+    })
     .on("click", (_event, d) => {
       const ids = idsByGroup.get(d.interestGroup) ?? [];
       if (ids.length > 0) selection.setIds(ids, { kind: "chart" });
